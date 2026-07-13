@@ -1,0 +1,143 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+#define FSR_PIN 2   // ⚠️ Change if needed (GPIO0/1/3/4 recommended)
+
+// 🔥 HOTSPOT
+const char* ssid = "SmartGlove";
+const char* password = "12345678";
+
+WebServer server(80);
+
+// ----- SENSOR VARIABLES -----
+int baseline = 0;
+int lastValue = 0;
+
+const int baselineSamples = 30;
+const int noiseThreshold = 10;       // was 30
+const int pressThreshold = 80;       // was 150
+const int hardPressThreshold = 250;  // was 600
+const int stableCountRequired = 0;  // was 4
+
+bool wasPressed = false;   // 🔥 for click detection
+
+// ---------- SMOOTH READ ----------
+int readFSR() {
+  int sum = 0;
+  for (int i = 0; i < 5; i++) {   // reduced delay + faster response
+    sum += analogRead(FSR_PIN);
+    delay(1);
+  }
+  return sum / 5;
+}
+
+// ---------- CALIBRATION ----------
+void calibrateBaseline() {
+  int sum = 0;
+
+  Serial.println("Calibrating... DO NOT TOUCH SENSOR");
+  delay(3000);
+
+  for (int i = 0; i < baselineSamples; i++) {
+    int val = readFSR();
+    Serial.println(val);
+    sum += val;
+    delay(10);
+  }
+
+  baseline = sum / baselineSamples;
+
+  Serial.print("Baseline: ");
+  Serial.println(baseline);
+}
+
+// ---------- PRESS DETECTION ----------
+String detectPress(int value) {
+
+  int diff = value - baseline;
+
+  if (diff < noiseThreshold) {
+    return "No Press";
+  }
+
+  if (diff < pressThreshold) {
+    return "Light Contact";
+  }
+
+  if (diff < hardPressThreshold) {
+    return "Soft Press";
+  }
+
+  return "Hard Press";
+}
+// ---------- HTTP API ----------
+void handleData() {
+  int fsrValue = readFSR();
+
+  if (fsrValue > 3800) fsrValue = 3800;
+
+  String state = detectPress(fsrValue);
+
+  /// 🔥 CLICK DETECTION (EDGE BASED)
+  bool click = false;
+
+  if (state == "Hard Press" && !wasPressed) {
+    click = true;          // ONLY ON FIRST PRESS
+    wasPressed = true;
+  }
+
+  if (state == "No Press") {
+    wasPressed = false;    // RESET
+  }
+
+  /// 🔥 JSON RESPONSE
+  String json = "{";
+  json += "\"value\":" + String(fsrValue) + ",";
+  json += "\"state\":\"" + state + "\",";
+  json += "\"click\":" + String(click ? "true" : "false");
+  json += "}";
+
+  Serial.print("FSR=");
+Serial.print(fsrValue);
+
+Serial.print("  STATE=");
+Serial.print(state);
+
+Serial.print("  CLICK=");
+Serial.println(click);// 🔥 DEBUG
+
+  server.send(200, "application/json", json);
+}
+
+// ---------- SETUP ----------
+void setup() {
+  Serial.begin(115200);
+  pinMode(FSR_PIN, INPUT);
+
+  // 🔥 START HOTSPOT
+  WiFi.softAP(ssid, password);
+
+  Serial.println("Hotspot Started");
+  Serial.print("IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // 🔥 ROUTE
+  server.on("/data", handleData);
+
+  server.begin();
+
+  // 🔥 CALIBRATION
+  calibrateBaseline();
+}
+
+// ---------- LOOP ----------
+void loop() {
+  server.handleClient();
+
+  // Optional debug
+  int val = readFSR();
+  Serial.print("Live Value: ");
+  Serial.println(val);
+
+  delay(100);
+}
