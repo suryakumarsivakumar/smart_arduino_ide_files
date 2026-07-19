@@ -1,0 +1,468 @@
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <math.h>
+
+#define I2S_PORT I2S_NUM_0
+
+// ---------------------------
+// Your Wiring
+// ---------------------------
+#define PIN_BCLK 4
+#define PIN_WS   5
+#define PIN_SD   6
+
+// ---------------------------
+// Audio Configuration
+// ---------------------------
+#define SAMPLE_RATE        16000
+#define BITS_PER_SAMPLE    I2S_BITS_PER_SAMPLE_32BIT
+#define BUFFER_SAMPLES     512
+
+// ---------------------------
+// Diagnostic Thresholds
+// ---------------------------
+#define ZERO_THRESHOLD     500
+#define SIGNAL_THRESHOLD   5000
+#define FLOAT_THRESHOLD    100
+
+int32_t audioBuffer[BUFFER_SAMPLES];
+
+// ---------------------------
+// Statistics Structure
+// ---------------------------
+struct AudioStats
+{
+    int32_t minimum;
+    int32_t maximum;
+    int64_t sum;
+    double average;
+    double rms;
+
+    uint32_t zeros;
+    uint32_t minusOnes;
+    uint32_t repeated;
+    uint32_t changing;
+
+    bool allZero;
+    bool allMinusOne;
+    bool floating;
+    bool validSignal;
+};
+
+AudioStats stats;
+
+// ---------------------------
+// Reset Statistics
+// ---------------------------
+void resetStats()
+{
+    stats.minimum = INT32_MAX;
+    stats.maximum = INT32_MIN;
+    stats.sum = 0;
+
+    stats.average = 0;
+    stats.rms = 0;
+
+    stats.zeros = 0;
+    stats.minusOnes = 0;
+    stats.repeated = 0;
+    stats.changing = 0;
+
+    stats.allZero = false;
+    stats.allMinusOne = false;
+    stats.floating = false;
+    stats.validSignal = false;
+}
+
+// ---------------------------
+// I2S Configuration
+// ---------------------------
+i2s_config_t i2s_config =
+{
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+
+    .sample_rate = SAMPLE_RATE,
+
+    .bits_per_sample = BITS_PER_SAMPLE,
+
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+
+    .dma_buf_count = 8,
+
+    .dma_buf_len = 128,
+
+    .use_apll = false,
+
+    .tx_desc_auto_clear = false,
+
+    .fixed_mclk = 0
+};
+
+// ---------------------------
+// Pin Configuration
+// ---------------------------
+i2s_pin_config_t pin_config =
+{
+    .bck_io_num = PIN_BCLK,
+
+    .ws_io_num = PIN_WS,
+
+    .data_out_num = I2S_PIN_NO_CHANGE,
+
+    .data_in_num = PIN_SD
+};
+
+// ---------------------------
+// Setup
+// ---------------------------
+void setup()
+{
+    Serial.begin(115200);
+
+    delay(2000);
+
+    Serial.println();
+    Serial.println("===================================");
+    Serial.println("ESP32-C3 INMP441 Diagnostic Tool");
+    Serial.println("===================================");
+
+    Serial.println();
+
+    Serial.println("Board : ESP32-C3 DevKitM-1");
+
+    Serial.println("Installing I2S Driver...");
+
+    esp_err_t err;
+
+    err = i2s_driver_install(
+            I2S_PORT,
+            &i2s_config,
+            0,
+            NULL);
+
+    if(err != ESP_OK)
+    {
+        Serial.printf("Driver Install Failed (%d)\n",err);
+
+        while(true);
+    }
+
+    Serial.println("Driver Installed");
+
+    err = i2s_set_pin(
+            I2S_PORT,
+            &pin_config);
+
+    if(err != ESP_OK)
+    {
+        Serial.printf("Pin Config Failed (%d)\n",err);
+
+        while(true);
+    }
+
+    Serial.println("Pins Configured");
+
+    i2s_zero_dma_buffer(I2S_PORT);
+
+    Serial.println("DMA Buffer Cleared");
+
+    Serial.println();
+
+    Serial.println("Initialization Successful");
+
+    Serial.println();
+}
+
+// ----------------------------------------------------
+// Read one audio buffer from the microphone
+// ----------------------------------------------------
+bool captureAudio(size_t &bytesRead)
+{
+    bytesRead = 0;
+
+    esp_err_t err = i2s_read(
+        I2S_PORT,
+        audioBuffer,
+        sizeof(audioBuffer),
+        &bytesRead,
+        pdMS_TO_TICKS(1000));
+
+        for (int i = 0; i < BUFFER_SAMPLES; i++)
+{
+    audioBuffer[i] >>= 8;
+}
+
+    if (err != ESP_OK)
+    {
+        Serial.printf("I2S Read Error : %d\n", err);
+        return false;
+    }
+
+    if (bytesRead == 0)
+    {
+        Serial.println("No audio data received.");
+        return false;
+    }
+
+    return true;
+}
+
+// ----------------------------------------------------
+// Print first few samples
+// ----------------------------------------------------
+void printFirstSamples(int count = 16)
+{
+    Serial.println("--------------------------------");
+    Serial.println("First Audio Samples");
+    Serial.println("--------------------------------");
+
+    int totalSamples = sizeof(audioBuffer) / sizeof(audioBuffer[0]);
+
+    if (count > totalSamples)
+        count = totalSamples;
+
+    for (int i = 0; i < count; i++)
+    {
+        Serial.printf("[%02d] %ld (0x%08lX)\n",
+                      i,
+                      (long)audioBuffer[i],
+                      (uint32_t)audioBuffer[i]);
+    }
+
+    Serial.println();
+}
+
+// ----------------------------------------------------
+// Check whether data is changing
+// ----------------------------------------------------
+void analyzeRawData()
+{
+    resetStats();
+
+    const int totalSamples =
+        sizeof(audioBuffer) / sizeof(audioBuffer[0]);
+
+    int32_t previous = audioBuffer[0];
+
+    for (int i = 0; i < totalSamples; i++)
+    {
+        int32_t value = audioBuffer[i];
+
+        if (value < stats.minimum)
+            stats.minimum = value;
+
+        if (value > stats.maximum)
+            stats.maximum = value;
+
+        stats.sum += value;
+
+        if (value == 0)
+            stats.zeros++;
+
+        if (value == -1)
+            stats.minusOnes++;
+
+        if (value == previous)
+            stats.repeated++;
+        else
+            stats.changing++;
+
+        previous = value;
+    }
+
+    stats.average =
+        (double)stats.sum / totalSamples;
+
+    stats.allZero =
+        (stats.zeros == totalSamples);
+
+    stats.allMinusOne =
+        (stats.minusOnes == totalSamples);
+
+    Serial.println("--------------------------------");
+    Serial.println("Raw Data Report");
+    Serial.println("--------------------------------");
+
+    Serial.printf("Samples      : %d\n", totalSamples);
+    Serial.printf("Minimum      : %ld\n", (long)stats.minimum);
+    Serial.printf("Maximum      : %ld\n", (long)stats.maximum);
+    Serial.printf("Average      : %.2f\n", stats.average);
+    Serial.printf("Zeros        : %lu\n", stats.zeros);
+    Serial.printf("Minus Ones   : %lu\n", stats.minusOnes);
+    Serial.printf("Repeated     : %lu\n", stats.repeated);
+    Serial.printf("Changed      : %lu\n", stats.changing);
+
+    Serial.println();
+
+    if (stats.allZero)
+        Serial.println("WARNING : Every sample is ZERO.");
+
+    if (stats.allMinusOne)
+        Serial.println("WARNING : Every sample is -1.");
+
+    if (!stats.allZero && !stats.allMinusOne)
+        Serial.println("Raw data appears to be changing.");
+}
+
+// ----------------------------------------------------
+// Calculate RMS
+// ----------------------------------------------------
+void calculateRMS()
+{
+    const int totalSamples =
+        sizeof(audioBuffer) / sizeof(audioBuffer[0]);
+
+    double sumSquares = 0.0;
+
+    for (int i = 0; i < totalSamples; i++)
+    {
+        double value = (double)audioBuffer[i];
+        sumSquares += value * value;
+    }
+
+    stats.rms = sqrt(sumSquares / totalSamples);
+}
+
+// ----------------------------------------------------
+// Analyze signal quality
+// ----------------------------------------------------
+void analyzeSignal()
+{
+    int64_t peakToPeak =
+        (int64_t)stats.maximum - (int64_t)stats.minimum;
+
+    Serial.println("--------------------------------");
+    Serial.println("Signal Analysis");
+    Serial.println("--------------------------------");
+
+    Serial.printf("Peak To Peak : %lld\n", peakToPeak);
+    Serial.printf("RMS          : %.2f\n", stats.rms);
+
+    // Floating / disconnected detection
+    if (peakToPeak < FLOAT_THRESHOLD)
+    {
+        stats.floating = true;
+    }
+
+    // Valid signal detection
+    if (peakToPeak > SIGNAL_THRESHOLD &&
+        stats.rms > SIGNAL_THRESHOLD / 4)
+    {
+        stats.validSignal = true;
+    }
+    else
+    {
+        stats.validSignal = false;
+    }
+
+    Serial.println();
+
+    if (stats.floating)
+    {
+        Serial.println("Result : INPUT APPEARS FLOATING");
+    }
+
+    if (stats.validSignal)
+    {
+        Serial.println("Result : VALID AUDIO SIGNAL DETECTED");
+    }
+
+    if (!stats.validSignal && !stats.floating)
+    {
+        Serial.println("Result : WEAK OR INVALID SIGNAL");
+    }
+
+    Serial.println();
+}
+
+// ----------------------------------------------------
+// Diagnose probable cause
+// ----------------------------------------------------
+void diagnose()
+{
+    Serial.println("================================");
+    Serial.println("DIAGNOSIS");
+    Serial.println("================================");
+
+    if (stats.allZero)
+    {
+        Serial.println("Possible Causes:");
+        Serial.println(" - SD pin not connected");
+        Serial.println(" - Microphone not powered");
+        Serial.println(" - Wrong GPIO mapping");
+        Serial.println(" - I2S clock not reaching microphone");
+    }
+    else if (stats.allMinusOne)
+    {
+        Serial.println("Possible Causes:");
+        Serial.println(" - SD line pulled HIGH");
+        Serial.println(" - Incorrect communication format");
+        Serial.println(" - Faulty microphone");
+    }
+    else if (stats.floating)
+    {
+        Serial.println("Possible Causes:");
+        Serial.println(" - Loose wiring");
+        Serial.println(" - Poor solder joint");
+        Serial.println(" - SD line disconnected");
+    }
+    else if (stats.validSignal)
+    {
+        Serial.println("Microphone appears to be working correctly.");
+        Serial.println("If speech recognition still fails,");
+        Serial.println("the issue is likely in software processing.");
+    }
+    else
+    {
+        Serial.println("Audio detected but signal quality is poor.");
+        Serial.println("Try speaking closer to the microphone.");
+    }
+
+    Serial.println("================================");
+    Serial.println();
+}
+
+// ----------------------------------------------------
+// Main Loop
+// ----------------------------------------------------
+void loop()
+{
+    size_t bytesRead = 0;
+
+    Serial.println();
+    Serial.println("==========================================");
+    Serial.println("Starting New Diagnostic Cycle");
+    Serial.println("==========================================");
+
+    // Capture Audio
+    if (!captureAudio(bytesRead))
+    {
+        Serial.println("Audio Capture Failed.");
+        delay(1000);
+        return;
+    }
+
+    Serial.printf("Bytes Received : %u\n\n", (unsigned int)bytesRead);
+
+    // Print first samples
+    printFirstSamples(16);
+
+    // Analyze raw data
+    analyzeRawData();
+
+    // Calculate RMS
+    calculateRMS();
+
+    // Analyze signal
+    analyzeSignal();
+
+    // Final diagnosis
+    diagnose();
+
+    Serial.println("Waiting 1 second...");
+    delay(1000);
+}
