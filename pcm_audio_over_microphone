@@ -1,0 +1,301 @@
+/*********************************************************************
+ * SMART Microphone Test - Phase 1A (Part 1)
+ * ESP32-C3 + INMP441
+ *
+ * Purpose:
+ *   - Initialize INMP441
+ *   - Prepare 16-bit PCM buffer
+ *   - Verify I2S is working
+ *
+ * Sample Rate : 16000 Hz
+ * Buffer Size : 512 samples
+ *********************************************************************/
+
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <math.h>
+
+//
+//==========================================================
+// Pin Mapping
+//==========================================================
+//
+
+constexpr uint8_t PIN_I2S_BCLK = 4;
+constexpr uint8_t PIN_I2S_WS   = 5;
+constexpr uint8_t PIN_I2S_SD   = 6;
+
+//
+//==========================================================
+// Audio Configuration
+//==========================================================
+//
+
+#define I2S_PORT        I2S_NUM_0
+#define SAMPLE_RATE     16000
+#define BUFFER_SAMPLES  512
+
+//
+//==========================================================
+// Audio Buffers
+//==========================================================
+//
+
+// Raw 32-bit samples directly from INMP441
+int32_t rawBuffer[BUFFER_SAMPLES];
+
+// Converted 16-bit PCM samples
+int16_t pcmBuffer[BUFFER_SAMPLES];
+
+//
+//==========================================================
+// Audio Statistics
+//==========================================================
+//
+
+int16_t sampleMin = 0;
+int16_t sampleMax = 0;
+int32_t peakValue = 0;
+float rmsValue = 0;
+
+//
+//==========================================================
+// I2S Configuration
+//==========================================================
+//
+
+i2s_config_t i2s_config =
+{
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+
+    .sample_rate = SAMPLE_RATE,
+
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+
+    .dma_buf_count = 8,
+
+    .dma_buf_len = 128,
+
+    .use_apll = false,
+
+    .tx_desc_auto_clear = false,
+
+    .fixed_mclk = 0
+};
+
+i2s_pin_config_t pin_config =
+{
+    .bck_io_num = PIN_I2S_BCLK,
+
+    .ws_io_num = PIN_I2S_WS,
+
+    .data_out_num = I2S_PIN_NO_CHANGE,
+
+    .data_in_num = PIN_I2S_SD
+};
+
+//
+//==========================================================
+// Initialize Microphone
+//==========================================================
+//
+
+void initMicrophone()
+{
+    Serial.println();
+    Serial.println("=================================");
+    Serial.println(" SMART MICROPHONE TEST");
+    Serial.println("=================================");
+
+    esp_err_t err;
+
+    err = i2s_driver_install(
+            I2S_PORT,
+            &i2s_config,
+            0,
+            NULL);
+
+    if(err != ESP_OK)
+    {
+        Serial.print("Driver Install Failed : ");
+        Serial.println(err);
+
+        while(true);
+    }
+
+    err = i2s_set_pin(
+            I2S_PORT,
+            &pin_config);
+
+    if(err != ESP_OK)
+    {
+        Serial.print("Pin Config Failed : ");
+        Serial.println(err);
+
+        while(true);
+    }
+
+    i2s_zero_dma_buffer(I2S_PORT);
+
+    Serial.println("INMP441 Initialized Successfully");
+    Serial.println();
+}
+
+//
+//==========================================================
+// Setup
+//==========================================================
+//
+
+void setup()
+{
+    Serial.begin(115200);
+
+    delay(2000);
+
+    initMicrophone();
+}
+
+//
+//==========================================================
+// Loop
+//==========================================================
+//
+
+void loop()
+{
+    if(captureAudio())
+    {
+        analyzeAudio();
+
+        printAudioStatus();
+    }
+
+    delay(1000);
+}
+//
+//==========================================================
+// Capture Audio
+//==========================================================
+//
+
+bool captureAudio()
+{
+    size_t bytesRead = 0;
+
+    esp_err_t err =
+        i2s_read(
+            I2S_PORT,
+            rawBuffer,
+            sizeof(rawBuffer),
+            &bytesRead,
+            portMAX_DELAY);
+
+    if(err != ESP_OK)
+    {
+        Serial.print("I2S Read Error : ");
+        Serial.println(err);
+        return false;
+    }
+
+    if(bytesRead == 0)
+    {
+        Serial.println("No Audio Received");
+        return false;
+    }
+
+    int samples = bytesRead / sizeof(int32_t);
+
+    //------------------------------------------------------
+    // Convert 32-bit I2S to 16-bit PCM
+    //------------------------------------------------------
+
+    for(int i=0;i<samples;i++)
+    {
+        pcmBuffer[i] = rawBuffer[i] >> 14;
+    }
+
+    return true;
+}
+
+//
+//==========================================================
+// Analyze Audio
+//==========================================================
+//
+
+void analyzeAudio()
+{
+    sampleMin = 32767;
+    sampleMax = -32768;
+
+    long long sumSquares = 0;
+
+    for(int i=0;i<BUFFER_SAMPLES;i++)
+    {
+        int16_t sample = pcmBuffer[i];
+
+        if(sample < sampleMin)
+            sampleMin = sample;
+
+        if(sample > sampleMax)
+            sampleMax = sample;
+
+        sumSquares +=
+            (long long)sample *
+            (long long)sample;
+    }
+
+    peakValue = sampleMax - sampleMin;
+
+    rmsValue =
+        sqrt(
+            (double)sumSquares /
+            BUFFER_SAMPLES
+        );
+}
+
+//
+//==========================================================
+// Print Audio Information
+//==========================================================
+//
+
+void printAudioStatus()
+{
+    Serial.println();
+    Serial.println("======================================");
+    Serial.println("MICROPHONE PCM TEST");
+    Serial.println("======================================");
+
+    Serial.print("Minimum : ");
+    Serial.println(sampleMin);
+
+    Serial.print("Maximum : ");
+    Serial.println(sampleMax);
+
+    Serial.print("Peak    : ");
+    Serial.println(peakValue);
+
+    Serial.print("RMS     : ");
+    Serial.println(rmsValue);
+
+    Serial.println();
+
+    Serial.println("First 10 PCM Samples");
+
+    for(int i=0;i<10;i++)
+    {
+        Serial.print(i);
+        Serial.print(" : ");
+        Serial.println(pcmBuffer[i]);
+    }
+
+    Serial.println("======================================");
+}
