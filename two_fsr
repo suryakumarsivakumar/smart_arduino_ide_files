@@ -1,0 +1,121 @@
+/*
+==========================================================
+  TWO FSR TEST
+  Board : ESP32-C3 Dev Module
+
+  GPIO0 -> FSR1
+  GPIO1 -> FSR2
+
+  Wiring
+
+  3.3V
+    |
+   FSR
+    |
+ GPIO
+    |
+ 47k
+    |
+   GND
+==========================================================
+*/
+
+#include <Arduino.h>
+
+const int FSR1_PIN = 0;
+const int FSR2_PIN = 1;
+
+int baseline1 = 0;
+int baseline2 = 0;
+
+const int CALIBRATION_SAMPLES = 100;
+
+void calibrate()
+{
+    long sum1 = 0;
+    long sum2 = 0;
+
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("CALIBRATION");
+    Serial.println("Do NOT touch the sensors");
+    Serial.println("==============================");
+
+    delay(3000);
+
+    for(int i=0;i<CALIBRATION_SAMPLES;i++)
+    {
+        sum1 += analogRead(FSR1_PIN);
+        sum2 += analogRead(FSR2_PIN);
+
+        delay(10);
+    }
+
+    baseline1 = sum1 / CALIBRATION_SAMPLES;
+    baseline2 = sum2 / CALIBRATION_SAMPLES;
+
+    Serial.println();
+
+    Serial.print("Baseline FSR1 = ");
+    Serial.println(baseline1);
+
+    Serial.print("Baseline FSR2 = ");
+    Serial.println(baseline2);
+
+    Serial.println();
+}
+
+void setup()
+{
+    Serial.begin(115200);
+
+    delay(2000);
+
+    analogReadResolution(12);
+
+    pinMode(FSR1_PIN, INPUT);
+    pinMode(FSR2_PIN, INPUT);
+
+    calibrate();
+}
+
+void loop()
+{
+    int raw1 = analogRead(FSR1_PIN);
+    int raw2 = analogRead(FSR2_PIN);
+
+    int force1 = raw1 - baseline1;
+    int force2 = raw2 - baseline2;
+
+    if(force1 < 0) force1 = 0;
+    if(force2 < 0) force2 = 0;
+
+    Serial.println("====================================");
+
+    Serial.print("FSR1 Raw      : ");
+    Serial.println(raw1);
+
+    Serial.print("FSR1 Baseline : ");
+    Serial.println(baseline1);
+
+    Serial.print("FSR1 Force    : ");
+    Serial.println(force1);
+
+    Serial.println();
+
+    Serial.print("FSR2 Raw      : ");
+    Serial.println(raw2);
+
+    Serial.print("FSR2 Baseline : ");
+    Serial.println(baseline2);
+
+    Serial.print("FSR2 Force    : ");
+    Serial.println(force2);
+
+    Serial.println();
+
+    Serial.print("Difference    : ");
+    Serial.println(abs(raw1 - raw2));
+
+    delay(100);
+}
