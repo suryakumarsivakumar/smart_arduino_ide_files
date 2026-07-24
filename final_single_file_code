@@ -1,0 +1,1105 @@
+/*********************************************************************
+ * SMART Firmware - INTEGRATED BUILD
+ * Surgical Monitoring And Analytics in Real Time
+ *
+ * Board : ESP32-C3 Dev Module
+ *
+ * This file merges two prior firmwares:
+ *
+ *   - "Base" microphone firmware (continuous I2S capture, ring
+ *     buffer, adaptive /pcm streaming). Its audio architecture is
+ *     UNCHANGED here and is treated as a black box.
+ *
+ *   - "SMART v2.0" firmware, from which ONLY the FSR engine,
+ *     battery engine, and HTTP/JSON layer (/, /health, /data) were
+ *     imported. Its old blocking microphone implementation
+ *     (captureMicrophone/updateMicrophone/analyzeMicrophone/
+ *     MicrophoneData/micBuffer) was intentionally NOT imported.
+ *
+ * Hardware
+ * --------
+ * GPIO3  -> FSR 1
+ * GPIO1  -> FSR 2
+ * GPIO2  -> Battery Divider
+ *
+ * GPIO4  -> INMP441 BCLK
+ * GPIO5  -> INMP441 WS/LRCL
+ * GPIO6  -> INMP441 SD
+ *
+ *********************************************************************/
+
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <math.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+//
+//==========================================================
+// Firmware Identity (from SMART firmware)
+//==========================================================
+//
+
+#define FW_NAME        "SMART"
+#define FW_VERSION     "2.1.0-integrated"
+
+//
+//==========================================================
+// Pin Mapping
+//==========================================================
+//
+
+// --- Microphone pins (unchanged from base firmware) ---
+constexpr uint8_t PIN_I2S_BCLK = 4;
+constexpr uint8_t PIN_I2S_WS   = 5;
+constexpr uint8_t PIN_I2S_SD   = 6;
+
+// --- FSR / Battery pins (from SMART firmware) ---
+constexpr uint8_t PIN_FSR1    = 3;
+constexpr uint8_t PIN_FSR2    = 1;
+constexpr uint8_t PIN_BATTERY = 2;
+
+//
+//==========================================================
+// Audio Configuration (UNCHANGED from base firmware)
+//==========================================================
+//
+
+#define I2S_PORT        I2S_NUM_0
+#define SAMPLE_RATE     16000
+
+// Size of one raw DMA read chunk performed by the audio task.
+#define BUFFER_SAMPLES  256
+
+// Ring buffer capacity: ~4 seconds of headroom at 16kHz mono 16-bit.
+#define RING_BUFFER_SECONDS 4.0f
+#define RING_BUFFER_SAMPLES ((size_t)(SAMPLE_RATE * RING_BUFFER_SECONDS))
+
+// Adaptive /pcm packet sizing (unchanged).
+#define MIN_PACKET_SAMPLES 512    // 32ms floor
+#define MAX_PACKET_SAMPLES 2048   // 128ms cap
+
+#define HTTP_WAIT_STEP_MS   1
+#define HTTP_MAX_WAIT_MS    20
+
+//
+//==========================================================
+// Audio Buffers (UNCHANGED from base firmware)
+//==========================================================
+//
+
+int32_t rawBuffer[BUFFER_SAMPLES];
+int16_t pcmBuffer[BUFFER_SAMPLES];
+
+//
+//==========================================================
+// ADC / Battery / FSR constants (from SMART firmware)
+//==========================================================
+//
+
+constexpr float ADC_REFERENCE = 3.30f;
+constexpr uint16_t ADC_MAX = 4095;
+
+constexpr float BATTERY_DIVIDER = 2.0f;
+constexpr float BATTERY_MIN = 3.30f;
+constexpr float BATTERY_MAX = 4.20f;
+constexpr uint8_t BATTERY_SAMPLES = 10;
+
+constexpr uint8_t FSR_AVERAGE_SAMPLES = 5;
+constexpr uint16_t BASELINE_SAMPLES = 100;
+constexpr uint16_t NOISE_THRESHOLD = 10;
+constexpr uint16_t LIGHT_THRESHOLD = 80;
+constexpr uint16_t HARD_THRESHOLD = 250;
+constexpr uint16_t MAX_ADC_VALUE = 4095;
+
+//
+//==========================================================
+// WiFi (single shared AP config)
+//==========================================================
+//
+
+const char* WIFI_SSID = "SMART_DEVICE";
+const char* WIFI_PASSWORD = "12345678";
+
+WebServer server(80);
+
+//
+//==========================================================
+// Audio Statistics (UNCHANGED from base firmware)
+//==========================================================
+//
+
+int16_t sampleMin = 0;
+int16_t sampleMax = 0;
+int32_t peakValue = 0;
+float rmsValue = 0;
+
+//
+//==========================================================
+// Ring Buffer (UNCHANGED from base firmware)
+//==========================================================
+//
+
+typedef struct
+{
+    int16_t*          data;
+    size_t            capacity;
+    volatile size_t   head;
+    volatile size_t   tail;
+    volatile size_t   count;
+    SemaphoreHandle_t mutex;
+} RingBuffer;
+
+RingBuffer audioRing;
+int16_t ringStorage[RING_BUFFER_SAMPLES];
+
+TaskHandle_t audioTaskHandle = NULL;
+
+//
+//==========================================================
+// Audio Debug / Diagnostics Counters (UNCHANGED)
+//==========================================================
+//
+
+volatile uint32_t totalBytesCaptured   = 0;
+volatile uint32_t totalSamplesDropped  = 0;
+volatile bool     audioTaskRunning     = false;
+volatile uint32_t lastCaptureMillis    = 0;
+
+volatile uint32_t lastRequestMillis    = 0;
+volatile uint32_t lastRequestGapMs     = 0;
+volatile size_t   lastPacketSamples    = 0;
+volatile size_t   lastFillAtRequest    = 0;
+
+//
+//==========================================================
+// FSR / Battery Enums & Structs (from SMART firmware)
+//==========================================================
+//
+
+enum PressState
+{
+    NO_PRESS = 0,
+    LIGHT_CONTACT,
+    SOFT_PRESS,
+    HARD_PRESS
+};
+
+struct FSRSensor
+{
+    uint8_t pin;
+    int raw;
+    int baseline;
+    int force;
+    PressState state;
+    bool pressed;
+    bool lastPressed;
+    bool click;
+};
+
+struct BatteryData
+{
+    float voltage;
+    uint8_t percent;
+    bool low;
+    bool critical;
+};
+
+FSRSensor fsr1 = { PIN_FSR1, 0, 0, 0, NO_PRESS, false, false, false };
+FSRSensor fsr2 = { PIN_FSR2, 0, 0, 0, NO_PRESS, false, false, false };
+BatteryData battery = { 0.0f, 0, false, false };
+
+//
+//==========================================================
+// Timers
+//==========================================================
+//
+
+unsigned long bootTime = 0;
+
+unsigned long lastFSRUpdate = 0;      // FSR: 5 ms
+unsigned long lastBatteryUpdate = 0;  // Battery: 1000 ms
+unsigned long lastDebugPrintMs = 0;   // Debug (audio + FSR + battery): 2000 ms
+
+#define DEBUG_PRINT_INTERVAL_MS 2000
+
+//
+//==========================================================
+// JSON Buffer (from SMART firmware, enlarged for audio fields)
+//==========================================================
+//
+
+char jsonBuffer[900];
+
+//
+//==========================================================
+// I2S Configuration (UNCHANGED from base firmware)
+//==========================================================
+//
+
+i2s_config_t i2s_config =
+{
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+};
+
+i2s_pin_config_t pin_config =
+{
+    .bck_io_num = PIN_I2S_BCLK,
+    .ws_io_num = PIN_I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = PIN_I2S_SD
+};
+
+//
+//==========================================================
+// Forward Declarations
+//==========================================================
+//
+
+void initMicrophone();
+void startAudioTask();
+void initFSR();
+void updateBattery();
+void initWiFi();
+void initServer();
+void handlePCM();
+void handleRoot();
+void handleHealth();
+void handleData();
+void analyzeAudio();
+void printAudioStatus();
+void printDebugStatus();
+void printFSRStatus();
+void printBatteryStatus();
+const char* pressStateToString(PressState state);
+
+//
+//==========================================================
+// Ring Buffer Functions (UNCHANGED from base firmware)
+//==========================================================
+//
+
+void ringBufferInit(RingBuffer* rb, int16_t* storage, size_t capacitySamples)
+{
+    rb->data     = storage;
+    rb->capacity = capacitySamples;
+    rb->head     = 0;
+    rb->tail     = 0;
+    rb->count    = 0;
+    rb->mutex    = xSemaphoreCreateMutex();
+}
+
+void ringBufferWrite(RingBuffer* rb, const int16_t* samples, size_t count)
+{
+    if (rb->mutex == NULL) return;
+
+    if (xSemaphoreTake(rb->mutex, portMAX_DELAY) == pdTRUE)
+    {
+        for (size_t i = 0; i < count; i++)
+        {
+            rb->data[rb->head] = samples[i];
+            rb->head = (rb->head + 1) % rb->capacity;
+
+            if (rb->count < rb->capacity)
+            {
+                rb->count++;
+            }
+            else
+            {
+                rb->tail = (rb->tail + 1) % rb->capacity;
+                totalSamplesDropped++;
+            }
+        }
+
+        xSemaphoreGive(rb->mutex);
+    }
+}
+
+size_t ringBufferRead(RingBuffer* rb, int16_t* dest, size_t requestedSamples)
+{
+    size_t copied = 0;
+
+    if (rb->mutex == NULL) return 0;
+
+    if (xSemaphoreTake(rb->mutex, portMAX_DELAY) == pdTRUE)
+    {
+        size_t available = rb->count;
+        size_t toCopy = (requestedSamples < available) ? requestedSamples : available;
+
+        for (size_t i = 0; i < toCopy; i++)
+        {
+            dest[i] = rb->data[rb->tail];
+            rb->tail = (rb->tail + 1) % rb->capacity;
+        }
+
+        rb->count -= toCopy;
+        copied = toCopy;
+
+        xSemaphoreGive(rb->mutex);
+    }
+
+    return copied;
+}
+
+size_t ringBufferAvailable(RingBuffer* rb)
+{
+    size_t available = 0;
+
+    if (rb->mutex == NULL) return 0;
+
+    if (xSemaphoreTake(rb->mutex, portMAX_DELAY) == pdTRUE)
+    {
+        available = rb->count;
+        xSemaphoreGive(rb->mutex);
+    }
+
+    return available;
+}
+
+//
+//==========================================================
+// Initialize Microphone (UNCHANGED from base firmware)
+//==========================================================
+//
+
+void initMicrophone()
+{
+    Serial.println();
+    Serial.println("=================================");
+    Serial.println(" SMART MICROPHONE (base firmware)");
+    Serial.println("=================================");
+
+    esp_err_t err;
+
+    err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+
+    if (err != ESP_OK)
+    {
+        Serial.print("Driver Install Failed : ");
+        Serial.println(err);
+        while (true);
+    }
+
+    err = i2s_set_pin(I2S_PORT, &pin_config);
+
+    if (err != ESP_OK)
+    {
+        Serial.print("Pin Config Failed : ");
+        Serial.println(err);
+        while (true);
+    }
+
+    i2s_zero_dma_buffer(I2S_PORT);
+
+    Serial.println("INMP441 Initialized Successfully");
+    Serial.println();
+}
+
+//
+//==========================================================
+// Continuous Audio Capture Task (UNCHANGED from base firmware)
+//==========================================================
+//
+
+void audioCaptureTask(void* parameter)
+{
+    audioTaskRunning = true;
+
+    Serial.println("Audio Capture Task Started");
+
+    while (true)
+    {
+        size_t bytesRead = 0;
+
+        esp_err_t err =
+            i2s_read(I2S_PORT, rawBuffer, sizeof(rawBuffer), &bytesRead, portMAX_DELAY);
+
+        if (err != ESP_OK)
+        {
+            Serial.print("I2S Read Error : ");
+            Serial.println(err);
+            continue;
+        }
+
+        if (bytesRead == 0)
+        {
+            continue;
+        }
+
+        int samples = bytesRead / sizeof(int32_t);
+        if (samples > BUFFER_SAMPLES) samples = BUFFER_SAMPLES;
+
+        for (int i = 0; i < samples; i++)
+        {
+            pcmBuffer[i] = rawBuffer[i] >> 14;
+        }
+
+        ringBufferWrite(&audioRing, pcmBuffer, samples);
+
+        totalBytesCaptured += (samples * sizeof(int16_t));
+        lastCaptureMillis = millis();
+
+        analyzeAudio();
+    }
+}
+
+void startAudioTask()
+{
+    xTaskCreate(
+        audioCaptureTask,
+        "AudioCaptureTask",
+        4096,
+        NULL,
+        3,
+        &audioTaskHandle);
+}
+
+//
+//==========================================================
+// FSR ENGINE (imported from SMART firmware, unmodified)
+//==========================================================
+//
+
+const char* pressStateToString(PressState state)
+{
+    switch (state)
+    {
+        case NO_PRESS:      return "No Press";
+        case LIGHT_CONTACT:  return "Light Contact";
+        case SOFT_PRESS:     return "Soft Press";
+        case HARD_PRESS:     return "Hard Press";
+        default:             return "Unknown";
+    }
+}
+
+int readFSR(uint8_t pin)
+{
+    int sum = 0;
+
+    for (int i = 0; i < 3; i++)
+    {
+        sum += analogRead(pin);
+        delay(1);
+    }
+
+    return sum / 3;
+}
+
+PressState detectPress(int force)
+{
+    if (force < NOISE_THRESHOLD) return NO_PRESS;
+    if (force < LIGHT_THRESHOLD) return LIGHT_CONTACT;
+    if (force < HARD_THRESHOLD)  return SOFT_PRESS;
+
+    return HARD_PRESS;
+}
+
+void calibrateFSR(FSRSensor &sensor)
+{
+    long sum = 0;
+
+    Serial.print("Calibrating GPIO ");
+    Serial.println(sensor.pin);
+
+    delay(3000);
+
+    for (int i = 0; i < BASELINE_SAMPLES; i++)
+    {
+        int val = readFSR(sensor.pin);
+        sum += val;
+        delay(10);
+    }
+
+    sensor.baseline = sum / BASELINE_SAMPLES;
+
+    Serial.print("Baseline = ");
+    Serial.println(sensor.baseline);
+
+    sensor.raw = sensor.baseline;
+    sensor.force = 0;
+    sensor.state = NO_PRESS;
+    sensor.pressed = false;
+    sensor.lastPressed = false;
+    sensor.click = false;
+}
+
+void initFSR()
+{
+    pinMode(PIN_FSR1, INPUT);
+    pinMode(PIN_FSR2, INPUT);
+
+    Serial.println();
+    Serial.println("==============================");
+    Serial.println("FSR Calibration");
+    Serial.println("==============================");
+
+    calibrateFSR(fsr1);
+    calibrateFSR(fsr2);
+
+    Serial.println();
+    Serial.println("Calibration Complete");
+    Serial.println();
+}
+
+void updateFSR(FSRSensor &sensor)
+{
+    sensor.raw = readFSR(sensor.pin);
+
+    if (sensor.raw > 3800)
+        sensor.raw = 3800;
+
+    int diff = sensor.raw - sensor.baseline;
+
+    if (diff < 0)
+        diff = 0;
+
+    sensor.force = diff;
+    sensor.state = detectPress(sensor.force);
+    sensor.click = false;
+
+    if (sensor.state == HARD_PRESS && !sensor.lastPressed)
+    {
+        sensor.click = true;
+        sensor.lastPressed = true;
+    }
+
+    if (sensor.state == NO_PRESS)
+    {
+        sensor.lastPressed = false;
+    }
+
+    sensor.pressed = (sensor.state != NO_PRESS);
+}
+
+void updateAllFSR()
+{
+    updateFSR(fsr1);
+    updateFSR(fsr2);
+}
+
+inline int getFSR1Force() { return fsr1.force; }
+inline int getFSR2Force() { return fsr2.force; }
+inline bool isFSR1Pressed() { return fsr1.pressed; }
+inline bool isFSR2Pressed() { return fsr2.pressed; }
+
+void printFSRStatus()
+{
+    Serial.println("----------------------------------------");
+
+    Serial.printf(
+        "FSR1  Value:%4d  %s  Click:%s\n",
+        fsr1.raw, pressStateToString(fsr1.state), fsr1.click ? "YES" : "NO");
+
+    Serial.printf(
+        "FSR2  Value:%4d  %s  Click:%s\n",
+        fsr2.raw, pressStateToString(fsr2.state), fsr2.click ? "YES" : "NO");
+
+    Serial.println("----------------------------------------");
+}
+
+//
+//==========================================================
+// BATTERY ENGINE (imported from SMART firmware, unmodified)
+//==========================================================
+//
+
+float readBatteryVoltage()
+{
+    long adcSum = 0;
+
+    for (uint8_t i = 0; i < BATTERY_SAMPLES; i++)
+    {
+        adcSum += analogRead(PIN_BATTERY);
+        delay(2);
+    }
+
+    float adcValue = adcSum / (float)BATTERY_SAMPLES;
+
+    return ((adcValue / ADC_MAX) * ADC_REFERENCE * BATTERY_DIVIDER);
+}
+
+uint8_t batteryPercentage(float voltage)
+{
+    if (voltage >= BATTERY_MAX) return 100;
+    if (voltage <= BATTERY_MIN) return 0;
+
+    return (uint8_t)(((voltage - BATTERY_MIN) / (BATTERY_MAX - BATTERY_MIN)) * 100.0f);
+}
+
+void updateBattery()
+{
+    battery.voltage = readBatteryVoltage();
+    battery.percent = batteryPercentage(battery.voltage);
+    battery.low = (battery.percent <= 20);
+    battery.critical = (battery.percent <= 10);
+}
+
+void printBatteryStatus()
+{
+    Serial.println("--------------------------------");
+
+    Serial.print("Battery Voltage : ");
+    Serial.print(battery.voltage, 2);
+    Serial.println(" V");
+
+    Serial.print("Battery Percent : ");
+    Serial.print(battery.percent);
+    Serial.println("%");
+
+    Serial.print("Low Battery     : ");
+    Serial.println(battery.low ? "YES" : "NO");
+
+    Serial.print("Critical        : ");
+    Serial.println(battery.critical ? "YES" : "NO");
+
+    Serial.println("--------------------------------");
+}
+
+//
+//==========================================================
+// WiFi (base firmware config + power-save fix retained)
+//==========================================================
+//
+
+void initWiFi()
+{
+    Serial.println();
+    Serial.println("=================================");
+    Serial.println("Starting SMART Access Point");
+    Serial.println("=================================");
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(WIFI_SSID, WIFI_PASSWORD);
+
+    // Disable WiFi power-save (modem sleep) - critical for the
+    // audio stream, retained exactly as in the base firmware.
+    WiFi.setSleep(false);
+
+    Serial.print("SSID : ");
+    Serial.println(WIFI_SSID);
+
+    Serial.print("Password : ");
+    Serial.println(WIFI_PASSWORD);
+
+    Serial.print("IP Address : ");
+    Serial.println(WiFi.softAPIP());
+
+    Serial.println("Power Save : DISABLED");
+    Serial.println();
+}
+
+//
+//==========================================================
+// HTTP: /pcm handler (UNCHANGED from base firmware)
+//==========================================================
+//
+
+int16_t httpSendBuffer[MAX_PACKET_SAMPLES];
+
+void handlePCM()
+{
+    uint32_t now = millis();
+    lastRequestGapMs = now - lastRequestMillis;
+    lastRequestMillis = now;
+
+    server.client().setNoDelay(true);
+
+    size_t waited = 0;
+    size_t available = ringBufferAvailable(&audioRing);
+
+    while (available < MIN_PACKET_SAMPLES && waited < HTTP_MAX_WAIT_MS)
+    {
+        delay(HTTP_WAIT_STEP_MS);
+        waited += HTTP_WAIT_STEP_MS;
+        available = ringBufferAvailable(&audioRing);
+    }
+
+    lastFillAtRequest = available;
+
+    size_t toRequest = (available < MAX_PACKET_SAMPLES) ? available : MAX_PACKET_SAMPLES;
+    size_t samplesCopied = ringBufferRead(&audioRing, httpSendBuffer, toRequest);
+
+    lastPacketSamples = samplesCopied;
+
+    if (samplesCopied == 0)
+    {
+        server.send(503, "text/plain", "No Audio Available Yet");
+        return;
+    }
+
+    server.sendHeader("Cache-Control", "no-cache");
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+
+    server.send_P(
+        200,
+        "application/octet-stream",
+        (const char*)httpSendBuffer,
+        samplesCopied * sizeof(int16_t)
+    );
+}
+
+//
+//==========================================================
+// HTTP: SMART endpoints (imported from SMART firmware)
+//==========================================================
+//
+
+void handleRoot()
+{
+    snprintf(
+        jsonBuffer, sizeof(jsonBuffer),
+        "{"
+        "\"device\":\"%s\","
+        "\"firmware\":\"%s\","
+        "\"status\":\"Running\""
+        "}",
+        FW_NAME, FW_VERSION
+    );
+
+    server.send(200, "application/json", jsonBuffer);
+}
+
+void handleHealth()
+{
+    snprintf(
+        jsonBuffer, sizeof(jsonBuffer),
+        "{"
+        "\"status\":\"OK\","
+        "\"uptime\":%lu,"
+        "\"wifiClients\":%d,"
+        "\"batteryLow\":%s,"
+        "\"batteryCritical\":%s,"
+        "\"freeHeap\":%u"
+        "}",
+        millis() / 1000,
+        WiFi.softAPgetStationNum(),
+        battery.low ? "true" : "false",
+        battery.critical ? "true" : "false",
+        ESP.getFreeHeap()
+    );
+
+    server.send(200, "application/json", jsonBuffer);
+}
+
+// ---------- Main Data Endpoint ----------
+// Microphone section now reports the NEW audio engine's stats
+// (rms/peak/bufferFill/droppedSamples) instead of the old
+// microphone engine's MicrophoneData struct.
+void handleData()
+{
+    updateAllFSR();
+
+    size_t fillSamples = ringBufferAvailable(&audioRing);
+
+    snprintf(
+        jsonBuffer, sizeof(jsonBuffer),
+        "{"
+
+        "\"battery\":{"
+            "\"voltage\":%.2f,"
+            "\"percent\":%u,"
+            "\"low\":%s,"
+            "\"critical\":%s"
+        "},"
+
+        "\"fsr1\":{"
+            "\"value\":%d,"
+            "\"state\":\"%s\","
+            "\"pressed\":%s,"
+            "\"click\":%s"
+        "},"
+
+        "\"fsr2\":{"
+            "\"value\":%d,"
+            "\"state\":\"%s\","
+            "\"pressed\":%s,"
+            "\"click\":%s"
+        "},"
+
+        "\"audio\":{"
+            "\"rms\":%.2f,"
+            "\"peak\":%ld,"
+            "\"bufferFill\":%u,"
+            "\"droppedSamples\":%u"
+        "},"
+
+        "\"uptime\":%lu"
+
+        "}",
+
+        battery.voltage,
+        battery.percent,
+        battery.low ? "true" : "false",
+        battery.critical ? "true" : "false",
+
+        fsr1.raw,
+        pressStateToString(fsr1.state),
+        isFSR1Pressed() ? "true" : "false",
+        fsr1.click ? "true" : "false",
+
+        fsr2.raw,
+        pressStateToString(fsr2.state),
+        isFSR2Pressed() ? "true" : "false",
+        fsr2.click ? "true" : "false",
+
+        rmsValue,
+        (long)peakValue,
+        (unsigned)fillSamples,
+        (unsigned)totalSamplesDropped,
+
+        millis() / 1000
+    );
+
+    server.send(200, "application/json", jsonBuffer);
+
+    fsr1.click = false;
+    fsr2.click = false;
+}
+
+void initServer()
+{
+    server.on("/", handleRoot);
+    server.on("/health", handleHealth);
+    server.on("/data", handleData);
+    server.on("/pcm", HTTP_GET, handlePCM);
+
+    server.begin();
+
+    Serial.println("HTTP Server Started (/, /health, /data, /pcm)");
+}
+
+//
+//==========================================================
+// Analyze Audio (UNCHANGED from base firmware)
+//==========================================================
+//
+
+void analyzeAudio()
+{
+    sampleMin = 32767;
+    sampleMax = -32768;
+
+    long long sumSquares = 0;
+
+    for (int i = 0; i < BUFFER_SAMPLES; i++)
+    {
+        int16_t sample = pcmBuffer[i];
+
+        if (sample < sampleMin) sampleMin = sample;
+        if (sample > sampleMax) sampleMax = sample;
+
+        sumSquares += (long long)sample * (long long)sample;
+    }
+
+    peakValue = sampleMax - sampleMin;
+    rmsValue = sqrt((double)sumSquares / BUFFER_SAMPLES);
+}
+
+void printAudioStatus()
+{
+    Serial.println();
+    Serial.println("======================================");
+    Serial.println("MICROPHONE PCM TEST");
+    Serial.println("======================================");
+
+    Serial.print("Minimum : "); Serial.println(sampleMin);
+    Serial.print("Maximum : "); Serial.println(sampleMax);
+    Serial.print("Peak    : "); Serial.println(peakValue);
+    Serial.print("RMS     : "); Serial.println(rmsValue);
+
+    Serial.println();
+    Serial.println("First 10 PCM Samples");
+
+    for (int i = 0; i < 10; i++)
+    {
+        Serial.print(i);
+        Serial.print(" : ");
+        Serial.println(pcmBuffer[i]);
+    }
+
+    Serial.println("======================================");
+}
+
+//
+//==========================================================
+// Print Continuous Audio Debug Status (UNCHANGED from base)
+//==========================================================
+//
+
+void printDebugStatus()
+{
+    size_t fillSamples = ringBufferAvailable(&audioRing);
+    float fillPercent = (100.0f * fillSamples) / RING_BUFFER_SAMPLES;
+
+    eTaskState taskState = eDeleted;
+    if (audioTaskHandle != NULL)
+    {
+        taskState = eTaskGetState(audioTaskHandle);
+    }
+
+    Serial.println();
+    Serial.println("---------- AUDIO DEBUG ----------");
+
+    Serial.print("Audio Task Running : ");
+    Serial.println(audioTaskRunning ? "YES" : "NO");
+
+    Serial.print("Audio Task State   : ");
+    Serial.println((int)taskState);
+
+    Serial.print("Bytes Captured (total) : ");
+    Serial.println(totalBytesCaptured);
+
+    Serial.print("Ring Buffer Fill  : ");
+    Serial.print(fillSamples);
+    Serial.print(" / ");
+    Serial.print(RING_BUFFER_SAMPLES);
+    Serial.print(" samples (");
+    Serial.print(fillPercent);
+    Serial.println("%)");
+
+    Serial.print("Dropped Samples (overwritten) : ");
+    Serial.println(totalSamplesDropped);
+
+    Serial.print("Last Chunk Min  : "); Serial.println(sampleMin);
+    Serial.print("Last Chunk Max  : "); Serial.println(sampleMax);
+    Serial.print("Last Chunk Peak : "); Serial.println(peakValue);
+    Serial.print("Last Chunk RMS  : "); Serial.println(rmsValue);
+
+    Serial.print("Last Capture (ms ago) : ");
+    Serial.println(millis() - lastCaptureMillis);
+
+    Serial.print("Last /pcm Gap (ms) : ");
+    Serial.println(lastRequestGapMs);
+
+    Serial.print("Last /pcm Fill At Request : ");
+    Serial.println(lastFillAtRequest);
+
+    Serial.print("Last /pcm Packet Sent (samples) : ");
+    Serial.println(lastPacketSamples);
+
+    Serial.println("----------------------------------");
+}
+
+//
+//==========================================================
+// SETUP
+//==========================================================
+//
+// Order: initMicrophone -> startAudioTask -> initFSR ->
+//        updateBattery -> initWiFi -> initServer
+//
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(2000);
+
+    Serial.println();
+    Serial.println("==================================================");
+    Serial.println(" SMART Firmware - Integrated Build");
+    Serial.println(" Surgical Monitoring And Analytics In Real Time");
+    Serial.println("==================================================");
+
+    bootTime = millis();
+
+    // Ring buffer must exist before the audio task starts writing to it.
+    ringBufferInit(&audioRing, ringStorage, RING_BUFFER_SAMPLES);
+
+    // ADC setup needed by FSR + battery reads.
+    analogReadResolution(12);
+    pinMode(PIN_BATTERY, INPUT);
+
+    initMicrophone();
+
+    startAudioTask();
+
+    initFSR();
+
+    updateBattery();
+
+    initWiFi();
+
+    initServer();
+
+    Serial.println();
+    Serial.println("====================================");
+    Serial.println(" SMART DEVICE READY");
+    Serial.println("====================================");
+
+    Serial.print("SSID : ");
+    Serial.println(WIFI_SSID);
+
+    Serial.print("IP   : ");
+    Serial.println(WiFi.softAPIP());
+
+    Serial.println();
+}
+
+//
+//==========================================================
+// LOOP
+//==========================================================
+//
+// server.handleClient() -> updateAllFSR() (5ms) ->
+// updateBattery() (1000ms) -> printDebugStatus()/
+// printFSRStatus()/printBatteryStatus() (2000ms)
+//
+// NOTE: there is intentionally NO microphone update here -
+// audio capture runs entirely inside audioCaptureTask().
+//
+
+void loop()
+{
+    server.handleClient();
+
+    unsigned long now = millis();
+
+    //--------------------------------------------------
+    // FSR Update (5 ms)
+    //--------------------------------------------------
+    if (now - lastFSRUpdate >= 5)
+    {
+        lastFSRUpdate = now;
+        updateAllFSR();
+    }
+
+    //--------------------------------------------------
+    // Battery Update (1000 ms)
+    //--------------------------------------------------
+    if (now - lastBatteryUpdate >= 1000)
+    {
+        lastBatteryUpdate = now;
+        updateBattery();
+    }
+
+    //--------------------------------------------------
+    // Debug Print (2000 ms): audio, then FSR, then battery
+    //--------------------------------------------------
+    if (now - lastDebugPrintMs >= DEBUG_PRINT_INTERVAL_MS)
+    {
+        lastDebugPrintMs = now;
+
+        printDebugStatus();
+        printFSRStatus();
+        printBatteryStatus();
+
+        Serial.print("WiFi Clients : ");
+        Serial.println(WiFi.softAPgetStationNum());
+
+        Serial.print("Free Heap    : ");
+        Serial.println(ESP.getFreeHeap());
+
+        Serial.print("Uptime (s)   : ");
+        Serial.println(now / 1000);
+    }
+}
