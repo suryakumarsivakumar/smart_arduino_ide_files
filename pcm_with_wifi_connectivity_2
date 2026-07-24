@@ -2,13 +2,56 @@
  * SMART Microphone Test - Phase 1A (Part 1)
  * ESP32-C3 + INMP441
  *
- * Purpose:
- *   - Initialize INMP441
- *   - Prepare 16-bit PCM buffer
- *   - Verify I2S is working
- *
  * Sample Rate : 16000 Hz
- * Buffer Size : 512 samples
+ * Capture Chunk : 256 samples (16ms) per I2S read
+ *
+ * --------------------------------------------------------------
+ * CONTINUOUS CAPTURE (v1)
+ * --------------------------------------------------------------
+ * A dedicated FreeRTOS task ("AudioCaptureTask") reads I2S
+ * continuously and writes into a circular ring buffer. The
+ * HTTP handler for /pcm only drains already-captured samples
+ * from that ring buffer - the microphone never stops.
+ *
+ * --------------------------------------------------------------
+ * OPTIMIZATION PASS (v2) - fixes remaining chop
+ * --------------------------------------------------------------
+ * Three additional issues were found and fixed:
+ *
+ * 1. ADAPTIVE PACKET SIZE (biggest fix)
+ *    v1 forced every /pcm response to wait until a full fixed
+ *    packet (2048 samples) was ready, waiting up to 60ms to do
+ *    it. That extra wait, stacked on top of normal network
+ *    round-trip time, meant the HTTP side could quietly fall
+ *    behind real time. Once behind, the ring buffer fills faster
+ *    than it drains and starts overwriting real, not-yet-sent
+ *    audio - i.e. genuine data loss, which is exactly the
+ *    "missing syllables" symptom. Now the handler sends whatever
+ *    is currently available (bounded by MIN/MAX_PACKET_SAMPLES)
+ *    and only waits briefly if the buffer is nearly empty, so
+ *    delivery paces itself with real-time capture instead of
+ *    accumulating a backlog.
+ *
+ * 2. WIFI POWER SAVE (modem sleep)
+ *    Enabled by default even in AP mode. It periodically parks
+ *    the radio to save power, which shows up as intermittent
+ *    100-300ms stalls on any latency-sensitive stream. Disabled
+ *    via WiFi.setSleep(false).
+ *
+ * 3. TCP NAGLE'S ALGORITHM
+ *    The socket used by WebServer batches small writes for up to
+ *    ~40ms by default. Disabled per-connection with
+ *    setNoDelay(true) so PCM packets go out immediately.
+ *
+ * Also: capture chunk size reduced 512 -> 256 samples (32ms ->
+ * 16ms) so freshly captured audio reaches the ring buffer sooner,
+ * and the ring buffer capacity was increased to 1.5s for more
+ * slack against network jitter.
+ *
+ * NOTE: ESP32-C3 is SINGLE-CORE (RISC-V). i2s_read() blocks on a
+ * DMA-ready semaphore (not a busy-loop) so it yields the CPU while
+ * idle, which is why the audio task and WiFi/HTTP coexist fine on
+ * one core via FreeRTOS time-slicing.
  *********************************************************************/
 
 #include <Arduino.h>
@@ -34,7 +77,32 @@ constexpr uint8_t PIN_I2S_SD   = 6;
 
 #define I2S_PORT        I2S_NUM_0
 #define SAMPLE_RATE     16000
-#define BUFFER_SAMPLES  512
+
+// Size of one raw DMA read chunk performed by the audio task.
+// Reduced from 512 -> 256 samples (16ms) so audio reaches the
+// ring buffer with lower latency and finer granularity.
+#define BUFFER_SAMPLES  256
+
+// Ring buffer capacity: ~1.5 seconds of headroom at 16kHz mono
+// 16-bit. 24000 samples * 2 bytes = 48000 bytes.
+#define RING_BUFFER_SECONDS 4.0f
+#define RING_BUFFER_SAMPLES ((size_t)(SAMPLE_RATE * RING_BUFFER_SECONDS))
+
+// Adaptive /pcm packet sizing. Instead of always waiting for a
+// fixed packet, the handler sends whatever is available between
+// these two bounds:
+//   - MIN_PACKET_SAMPLES: below this, wait a little (buffer is
+//     nearly empty) rather than send a tiny/empty packet.
+//   - MAX_PACKET_SAMPLES: cap on how much one response returns,
+//     just to keep HTTP overhead low and responses regular.
+#define MIN_PACKET_SAMPLES 512    // 32ms floor
+#define MAX_PACKET_SAMPLES 2048   // 128ms cap
+
+// Short, bounded wait used only when the buffer is under
+// MIN_PACKET_SAMPLES. Kept small on purpose - long forced waits
+// are what caused the backlog/overflow in v1.
+#define HTTP_WAIT_STEP_MS   1
+#define HTTP_MAX_WAIT_MS    20
 
 //
 //==========================================================
@@ -42,10 +110,11 @@ constexpr uint8_t PIN_I2S_SD   = 6;
 //==========================================================
 //
 
-// Raw 32-bit samples directly from INMP441
+// Raw 32-bit samples directly from INMP441 (used by the audio task)
 int32_t rawBuffer[BUFFER_SAMPLES];
 
-// Converted 16-bit PCM samples
+// Converted 16-bit PCM samples (last captured chunk - used for
+// analyzeAudio()/printAudioStatus() debug snapshot only)
 int16_t pcmBuffer[BUFFER_SAMPLES];
 
 //==========================================================
@@ -70,6 +139,51 @@ float rmsValue = 0;
 
 //
 //==========================================================
+// Ring Buffer (circular, thread-safe)
+//==========================================================
+//
+
+typedef struct
+{
+    int16_t*          data;
+    size_t            capacity;   // in samples
+    volatile size_t   head;       // next write index
+    volatile size_t   tail;       // next read index
+    volatile size_t   count;      // samples currently stored
+    SemaphoreHandle_t mutex;
+} RingBuffer;
+
+RingBuffer audioRing;
+
+// Statically allocated backing storage for the ring buffer
+int16_t ringStorage[RING_BUFFER_SAMPLES];
+
+// FreeRTOS task handle for the continuous capture task
+TaskHandle_t audioTaskHandle = NULL;
+
+//
+//==========================================================
+// Debug / Diagnostics Counters
+//==========================================================
+//
+
+volatile uint32_t totalBytesCaptured   = 0;
+volatile uint32_t totalSamplesDropped  = 0;
+volatile bool     audioTaskRunning     = false;
+volatile uint32_t lastCaptureMillis    = 0;
+
+// Tracks how far apart consecutive /pcm requests actually land,
+// which is useful for diagnosing client-side polling irregularity.
+volatile uint32_t lastRequestMillis    = 0;
+volatile uint32_t lastRequestGapMs     = 0;
+volatile size_t   lastPacketSamples    = 0;
+volatile size_t   lastFillAtRequest    = 0;
+
+unsigned long lastDebugPrintMs = 0;
+#define DEBUG_PRINT_INTERVAL_MS 2000
+
+//
+//==========================================================
 // I2S Configuration
 //==========================================================
 //
@@ -88,9 +202,13 @@ i2s_config_t i2s_config =
 
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
 
+    // Slightly more/larger DMA buffers than the original so the
+    // driver itself can absorb brief scheduling delays without
+    // dropping samples at the hardware level, on top of the ring
+    // buffer above it.
     .dma_buf_count = 8,
 
-    .dma_buf_len = 128,
+    .dma_buf_len = 256,
 
     .use_apll = false,
 
@@ -109,6 +227,96 @@ i2s_pin_config_t pin_config =
 
     .data_in_num = PIN_I2S_SD
 };
+
+//
+//==========================================================
+// Ring Buffer Functions
+//==========================================================
+//
+
+void ringBufferInit(RingBuffer* rb, int16_t* storage, size_t capacitySamples)
+{
+    rb->data     = storage;
+    rb->capacity = capacitySamples;
+    rb->head     = 0;
+    rb->tail     = 0;
+    rb->count    = 0;
+    rb->mutex    = xSemaphoreCreateMutex();
+}
+
+// Writes 'samples' int16 values into the ring buffer.
+// If the buffer is full, oldest samples are overwritten (dropped)
+// so the writer (audio task) never blocks and never leaks memory.
+void ringBufferWrite(RingBuffer* rb, const int16_t* samples, size_t count)
+{
+    if (rb->mutex == NULL) return;
+
+    if (xSemaphoreTake(rb->mutex, portMAX_DELAY) == pdTRUE)
+    {
+        for (size_t i = 0; i < count; i++)
+        {
+            rb->data[rb->head] = samples[i];
+            rb->head = (rb->head + 1) % rb->capacity;
+
+            if (rb->count < rb->capacity)
+            {
+                rb->count++;
+            }
+            else
+            {
+                // Buffer full: advance tail too (overwrite oldest sample)
+                rb->tail = (rb->tail + 1) % rb->capacity;
+                totalSamplesDropped++;
+            }
+        }
+
+        xSemaphoreGive(rb->mutex);
+    }
+}
+
+// Reads up to 'requestedSamples' into 'dest'.
+// Returns the number of samples actually copied (may be less than
+// requested if the buffer doesn't have that much data yet).
+size_t ringBufferRead(RingBuffer* rb, int16_t* dest, size_t requestedSamples)
+{
+    size_t copied = 0;
+
+    if (rb->mutex == NULL) return 0;
+
+    if (xSemaphoreTake(rb->mutex, portMAX_DELAY) == pdTRUE)
+    {
+        size_t available = rb->count;
+        size_t toCopy = (requestedSamples < available) ? requestedSamples : available;
+
+        for (size_t i = 0; i < toCopy; i++)
+        {
+            dest[i] = rb->data[rb->tail];
+            rb->tail = (rb->tail + 1) % rb->capacity;
+        }
+
+        rb->count -= toCopy;
+        copied = toCopy;
+
+        xSemaphoreGive(rb->mutex);
+    }
+
+    return copied;
+}
+
+size_t ringBufferAvailable(RingBuffer* rb)
+{
+    size_t available = 0;
+
+    if (rb->mutex == NULL) return 0;
+
+    if (xSemaphoreTake(rb->mutex, portMAX_DELAY) == pdTRUE)
+    {
+        available = rb->count;
+        xSemaphoreGive(rb->mutex);
+    }
+
+    return available;
+}
 
 //
 //==========================================================
@@ -159,12 +367,77 @@ void initMicrophone()
 
 //
 //==========================================================
+// Continuous Audio Capture Task
+//==========================================================
+//
+// Runs forever. Reads a chunk from I2S (blocking only this task,
+// never HTTP), converts to 16-bit PCM, updates the debug snapshot
+// buffers, and pushes the samples into the ring buffer.
+//
+
+void audioCaptureTask(void* parameter)
+{
+    audioTaskRunning = true;
+
+    Serial.println("Audio Capture Task Started");
+
+    while (true)
+    {
+        size_t bytesRead = 0;
+
+        esp_err_t err =
+            i2s_read(
+                I2S_PORT,
+                rawBuffer,
+                sizeof(rawBuffer),
+                &bytesRead,
+                portMAX_DELAY);
+
+        if (err != ESP_OK)
+        {
+            Serial.print("I2S Read Error : ");
+            Serial.println(err);
+            continue;
+        }
+
+        if (bytesRead == 0)
+        {
+            continue;
+        }
+
+        int samples = bytesRead / sizeof(int32_t);
+        if (samples > BUFFER_SAMPLES) samples = BUFFER_SAMPLES;
+
+        //------------------------------------------------------
+        // Convert 32-bit I2S to 16-bit PCM
+        //------------------------------------------------------
+
+        for (int i = 0; i < samples; i++)
+        {
+            pcmBuffer[i] = rawBuffer[i] >> 14;
+        }
+
+        // Push into the ring buffer for HTTP to consume
+        ringBufferWrite(&audioRing, pcmBuffer, samples);
+
+        totalBytesCaptured += (samples * sizeof(int16_t));
+        lastCaptureMillis = millis();
+
+        // Refresh the debug snapshot stats (min/max/peak/rms) from
+        // this chunk
+        analyzeAudio();
+    }
+}
+
+//
+//==========================================================
 // Setup
 //==========================================================
 //
 void initWiFi();
 void initServer();
 void handlePCM();
+void startAudioTask();
 
 void setup()
 {
@@ -172,23 +445,51 @@ void setup()
 
     delay(2000);
 
+    ringBufferInit(&audioRing, ringStorage, RING_BUFFER_SAMPLES);
+
     initMicrophone();
 
-initWiFi();
+    startAudioTask();
 
-initServer();
+    initWiFi();
+
+    initServer();
 }
+
+void startAudioTask()
+{
+    // Priority above the default loop/WiFi task (1) so freshly
+    // arrived DMA samples get drained into the ring buffer
+    // promptly. Still well below the ESP-IDF WiFi/LWIP internal
+    // tasks (~18-23), so networking is never starved.
+    xTaskCreate(
+        audioCaptureTask,
+        "AudioCaptureTask",
+        4096,
+        NULL,
+        3,
+        &audioTaskHandle);
+}
+
 void initWiFi()
 {
     WiFi.mode(WIFI_AP);
 
     WiFi.softAP(AP_SSID, AP_PASSWORD);
 
+    // Disable WiFi power-save (modem sleep). It's on by default
+    // even in AP mode and periodically parks the radio to save
+    // power - which shows up as intermittent 100-300ms stalls on
+    // a latency-sensitive audio stream. This one setting fixes a
+    // large share of "randomly missing syllables" symptoms.
+    WiFi.setSleep(false);
+
     Serial.println();
     Serial.println("=================================");
     Serial.println("WiFi AP Started");
     Serial.print("IP Address : ");
     Serial.println(WiFi.softAPIP());
+    Serial.println("Power Save : DISABLED");
     Serial.println("=================================");
 }
 //
@@ -200,57 +501,66 @@ void initWiFi()
 void loop()
 {
     server.handleClient();
+
+    // Periodic debug print (non-blocking, does not touch I2S)
+    unsigned long now = millis();
+    if (now - lastDebugPrintMs >= DEBUG_PRINT_INTERVAL_MS)
+    {
+        lastDebugPrintMs = now;
+        printDebugStatus();
+    }
 }
+
 //
 //==========================================================
-// Capture Audio
+// HTTP: /pcm handler
 //==========================================================
 //
+// Never calls captureAudio()/i2s_read(). Drains samples the
+// background audio task has already placed in the ring buffer,
+// using ADAPTIVE packet sizing:
+//   - If plenty of audio is buffered, send up to MAX_PACKET_SAMPLES
+//     immediately (no artificial wait).
+//   - If the buffer is thin (< MIN_PACKET_SAMPLES), wait briefly
+//     (<= HTTP_MAX_WAIT_MS) for a bit more to arrive, then send
+//     whatever is available - it never blocks waiting for a full
+//     fixed-size packet the way v1 did, which is what let the
+//     buffer silently fall behind real time.
+//
 
-bool captureAudio()
-{
-    size_t bytesRead = 0;
-
-    esp_err_t err =
-        i2s_read(
-            I2S_PORT,
-            rawBuffer,
-            sizeof(rawBuffer),
-            &bytesRead,
-            portMAX_DELAY);
-
-    if(err != ESP_OK)
-    {
-        Serial.print("I2S Read Error : ");
-        Serial.println(err);
-        return false;
-    }
-
-    if(bytesRead == 0)
-    {
-        Serial.println("No Audio Received");
-        return false;
-    }
-
-    int samples = bytesRead / sizeof(int32_t);
-
-    //------------------------------------------------------
-    // Convert 32-bit I2S to 16-bit PCM
-    //------------------------------------------------------
-
-    for(int i=0;i<samples;i++)
-    {
-        pcmBuffer[i] = rawBuffer[i] >> 14;
-    }
-
-    return true;
-}
+int16_t httpSendBuffer[MAX_PACKET_SAMPLES];
 
 void handlePCM()
 {
-    if (!captureAudio())
+    uint32_t now = millis();
+    lastRequestGapMs = now - lastRequestMillis;
+    lastRequestMillis = now;
+
+    // Disable Nagle's algorithm on this connection so packets go
+    // out immediately instead of being buffered for ~40ms.
+    server.client().setNoDelay(true);
+
+    size_t waited = 0;
+    size_t available = ringBufferAvailable(&audioRing);
+
+    while (available < MIN_PACKET_SAMPLES && waited < HTTP_MAX_WAIT_MS)
     {
-        server.send(500, "text/plain", "Capture Failed");
+        delay(HTTP_WAIT_STEP_MS);
+        waited += HTTP_WAIT_STEP_MS;
+        available = ringBufferAvailable(&audioRing);
+    }
+
+    lastFillAtRequest = available;
+
+    size_t toRequest = (available < MAX_PACKET_SAMPLES) ? available : MAX_PACKET_SAMPLES;
+
+    size_t samplesCopied = ringBufferRead(&audioRing, httpSendBuffer, toRequest);
+
+    lastPacketSamples = samplesCopied;
+
+    if (samplesCopied == 0)
+    {
+        server.send(503, "text/plain", "No Audio Available Yet");
         return;
     }
 
@@ -263,8 +573,8 @@ void handlePCM()
     server.send_P(
         200,
         "application/octet-stream",
-        (const char*)pcmBuffer,
-        sizeof(pcmBuffer)
+        (const char*)httpSendBuffer,
+        samplesCopied * sizeof(int16_t)
     );
 }
 
@@ -315,7 +625,7 @@ void analyzeAudio()
 
 //
 //==========================================================
-// Print Audio Information
+// Print Audio Information (on-demand snapshot, unchanged)
 //==========================================================
 //
 
@@ -350,4 +660,76 @@ void printAudioStatus()
     }
 
     Serial.println("======================================");
+}
+
+//
+//==========================================================
+// Print Continuous Debug Status
+//==========================================================
+//
+// Called periodically from loop(). Reports the health of the
+// background capture pipeline: bytes captured, ring buffer fill
+// level, RMS/peak/min/max from the latest chunk, dropped samples,
+// audio task status, and /pcm request timing.
+//
+
+void printDebugStatus()
+{
+    size_t fillSamples = ringBufferAvailable(&audioRing);
+    float fillPercent = (100.0f * fillSamples) / RING_BUFFER_SAMPLES;
+
+    eTaskState taskState = eDeleted;
+    if (audioTaskHandle != NULL)
+    {
+        taskState = eTaskGetState(audioTaskHandle);
+    }
+
+    Serial.println();
+    Serial.println("---------- AUDIO DEBUG ----------");
+
+    Serial.print("Audio Task Running : ");
+    Serial.println(audioTaskRunning ? "YES" : "NO");
+
+    Serial.print("Audio Task State   : ");
+    Serial.println((int)taskState); // 0=Running,1=Ready,2=Blocked,3=Suspended,4=Deleted
+
+    Serial.print("Bytes Captured (total) : ");
+    Serial.println(totalBytesCaptured);
+
+    Serial.print("Ring Buffer Fill  : ");
+    Serial.print(fillSamples);
+    Serial.print(" / ");
+    Serial.print(RING_BUFFER_SAMPLES);
+    Serial.print(" samples (");
+    Serial.print(fillPercent);
+    Serial.println("%)");
+
+    Serial.print("Dropped Samples (overwritten) : ");
+    Serial.println(totalSamplesDropped);
+
+    Serial.print("Last Chunk Min  : ");
+    Serial.println(sampleMin);
+
+    Serial.print("Last Chunk Max  : ");
+    Serial.println(sampleMax);
+
+    Serial.print("Last Chunk Peak : ");
+    Serial.println(peakValue);
+
+    Serial.print("Last Chunk RMS  : ");
+    Serial.println(rmsValue);
+
+    Serial.print("Last Capture (ms ago) : ");
+    Serial.println(millis() - lastCaptureMillis);
+
+    Serial.print("Last /pcm Gap (ms) : ");
+    Serial.println(lastRequestGapMs);
+
+    Serial.print("Last /pcm Fill At Request : ");
+    Serial.println(lastFillAtRequest);
+
+    Serial.print("Last /pcm Packet Sent (samples) : ");
+    Serial.println(lastPacketSamples);
+
+    Serial.println("----------------------------------");
 }
